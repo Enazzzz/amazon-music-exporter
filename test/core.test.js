@@ -137,13 +137,21 @@ test('normalizeTrack splits primary vs featured artists', () => {
 });
 
 test('query builders escape ids/cursors and match known-good shapes', () => {
-  assert.equal(Core.buildHistoryQuery(null, false), 'query{user{recentTrackPlayback(limit:100){edgeCount pageInfo{hasNextPage token endCursor} edges{playedAt node{__typename ... on Track{id title}}}}}}');
+  assert.equal(Core.buildHistoryQuery(null, false), 'query{user{recentTrackPlayback(limit:100){edgeCount pageInfo{hasNextPage token endCursor} edges{playedAt skipped device{family} node{__typename ... on Track{id title}}}}}}');
+  assert.equal(Core.buildHistoryQuery(null, false, 100, false), 'query{user{recentTrackPlayback(limit:100){edgeCount pageInfo{hasNextPage token endCursor} edges{playedAt node{__typename ... on Track{id title}}}}}}');
   assert.ok(Core.buildHistoryQuery('1761:ab"c', true).includes('cursor:"1761:ab\\"c"'));
   const q = Core.buildLookupQuery(['B000VZKU4K', 'B0CT4YR2SB']);
   assert.ok(q.startsWith('query{t0:track(id:"B000VZKU4K"){__typename ... on Track{'));
+  assert.ok(q.includes('isrc'));
   assert.ok(q.includes('t1:track(id:"B0CT4YR2SB")'));
   assert.ok(!/isExplicit/.test(Core.buildPlaylistQuery('x', null)));
   assert.ok(Core.buildPlaylistQuery('x', 'tok').includes('tracks(first:100, after:"tok")'));
+  assert.ok(Core.buildPlaylistQuery('x', null).includes('isrc'));
+  assert.ok(Core.buildArtistsQuery('followedArtists', null).includes('followedArtists(limit:100)'));
+  assert.ok(Core.buildArtistsQuery('libraryArtists', 'c').includes('cursor:"c"'));
+  assert.throws(() => Core.buildArtistsQuery('playlists'));
+  assert.ok(Core.buildRecentEntitiesQuery(50).includes('recentEntitiesPlayback(limit:50)'));
+  assert.ok(!/cursor:/.test(Core.buildRecentEntitiesQuery(50)));
 });
 
 // ---------------------------------------------------------------- mocked API
@@ -320,4 +328,59 @@ test('runLookup batches 40 and reports not-found', async () => {
   assert.equal(log.calls, 3);
   assert.equal(r.notFound.length, ids.filter((i) => i.endsWith('7')).length);
   assert.ok(log.sleeps.filter((s) => s > 0).every((s) => s <= 1500));
+});
+
+test('history row keeps skipped, device family, and isrc', () => {
+  const page = Core.parseHistoryPage({ data: { user: { recentTrackPlayback: { edgeCount: 1, pageInfo: { hasNextPage: false, token: null }, edges: [
+    { playedAt: '2026-01-02T03:04:05.000Z', skipped: true, device: { family: 'MobileiOS' }, node: { __typename: 'Track', id: 'B000000001', title: 'Song', duration: 180, album: { id: 'ALB', shortTitle: 'Alb' }, contributingArtists: { edges: [{ role: 'PRIMARY', node: { name: 'Artist' } }] } } },
+  ] } } } });
+  assert.equal(page.plays.length, 1);
+  assert.equal(page.plays[0].skipped, true);
+  assert.equal(page.plays[0].deviceFamily, 'MobileiOS');
+  const row = Core.historyCsvRow(Object.assign({}, page.plays[0], { isrc: 'USAAA0000001' }));
+  assert.deepEqual(Object.keys(row), Core.HISTORY_COLUMNS);
+  assert.equal(row.played_at, '2026-01-02T03:04:05.000Z');
+  assert.equal(row.skipped, true);
+  assert.equal(row.device_family, 'MobileiOS');
+  assert.equal(row.isrc, 'USAAA0000001');
+  const stats = Core.computeStats([{ playedAt: '2026-01-02T03:04:05.000Z', asin: 'B000000001', title: 'Song', artist: 'Artist', duration: 180, skipped: true }]);
+  assert.equal(stats.estimatedMinutes, 0);
+});
+
+test('artist and recently-opened parsers', () => {
+  const artists = Core.parseArtistsPage({ data: { user: { libraryArtists: { pageInfo: { hasNextPage: true, token: 'n' }, edges: [
+    { node: { id: 'A1', name: 'Kept', followsContext: { isFollowed: true } } },
+    { node: { id: 'A2', name: 'Not', followsContext: { isFollowed: false } } },
+    { node: null },
+  ] } } } }, 'libraryArtists');
+  assert.equal(artists.rows.length, 2);
+  assert.equal(artists.token, 'n');
+  assert.deepEqual(Core.libraryArtistCsvRow(artists.rows[1]), { id: 'A2', name: 'Not', isFollowed: false });
+  assert.deepEqual(Core.followedArtistCsvRow(artists.rows[0]), { id: 'A1', name: 'Kept', followed: true });
+  const recent = Core.parseRecentEntitiesPage({ data: { user: { recentEntitiesPlayback: { edges: [
+    { playedDate: '2026-11-01T00:00:00.000Z', node: { __typename: 'Album', id: 'ALB1', title: 'Album' } },
+    { playedDate: '2026-11-02T00:00:00.000Z', node: { __typename: 'Artist', id: 'ART1', name: 'Name' } },
+    { playedDate: null, node: null },
+  ] } } } });
+  assert.equal(recent.rows.length, 2);
+  assert.deepEqual(Core.recentEntityCsvRow(recent.rows[1]), { type: 'Artist', id: 'ART1', title: 'Name', opened_at: '2026-11-02T00:00:00.000Z' });
+});
+
+test('runArtists pages with the token cursor and runRecentEntities does not', async () => {
+  const { client, log } = makeClient((q) => {
+    if (q.includes('followedArtists')) {
+      const more = !q.includes('cursor:');
+      return mockResponse(200, { data: { user: { followedArtists: { pageInfo: { hasNextPage: more, token: more ? 'T' : null }, edges: [{ node: { id: more ? 'A1' : 'A2', name: 'N', followsContext: { isFollowed: true } } }] } } } });
+    }
+    if (q.includes('recentEntitiesPlayback')) {
+      assert.ok(!q.includes('cursor:'));
+      return mockResponse(200, { data: { user: { recentEntitiesPlayback: { edges: [{ playedDate: '2026-01-01T00:00:00.000Z', node: { __typename: 'Playlist', id: 'P1', title: 'Mix' } }] } } } });
+    }
+    throw new Error(q);
+  });
+  const artists = await Core.runArtists(client, 'followedArtists', {});
+  assert.deepEqual(artists.rows.map((r) => r.id), ['A1', 'A2']);
+  const recent = await Core.runRecentEntities(client, {});
+  assert.equal(recent.rows[0].title, 'Mix');
+  assert.equal(log.calls, 3);
 });

@@ -39,12 +39,15 @@ The first time the panel opens, it shows a short notice that you need to acknowl
 
 | Tab | Button | What you get |
 | --- | --- | --- |
-| **Playlist** | **Export playlist** | The playlist you're viewing, or any pasted playlist URL or ID. JSON + CSV with `position, asin, title, artist, featured_artists, album, album_asin, duration, track_number, explicit, lyrics, hd, ultra_hd, dolby_atmos, sony_360, liked, art_url, track_url`. The JSON summary lists duplicate entries along with their positions. |
-| **History** | **Export listening history** | Every play in the range you pick: last 7 / 30 / 90 days, last year, everything, or since a date you choose. CSV columns: `played_at_utc, played_at_local, asin, title, artist, featured_artists, album, album_asin, duration_sec`. The JSON adds stats (total plays, estimated listening hours, top artists and tracks, plays per month), and the panel shows them too. |
+| **Playlist** | **Export playlist** | The playlist you're viewing, or any pasted playlist URL or ID. JSON + CSV with `position, asin, title, artist, featured_artists, album, album_asin, duration, track_number, explicit, lyrics, hd, ultra_hd, dolby_atmos, sony_360, liked, art_url, track_url, isrc`. The JSON summary lists duplicate entries along with their positions. |
+| **History** | **Export listening history** | Every play in the range you pick: last 7 / 30 / 90 days, last year, everything, or since a date you choose. CSV columns: `played_at, asin, title, artist, album, duration, skipped, device_family, isrc`. ISRC is filled by looking up each unique track. The JSON adds stats (total plays, estimated listening hours, top artists and tracks, plays per month), and the panel shows them too. |
 | | *Only new plays since my last export* | Fetches only the plays newer than your last completed export, so you can build up a full archive over time. |
 | | *Resume interrupted export* | Long runs save a checkpoint every 10 pages. If the tab crashes or you cancel, you can pick up where it stopped. |
 | **More** | **Load my playlists → Export selected** | Lists your library playlists with checkboxes and exports the ones you pick into a single JSON plus one CSV that has a `playlist_title` column. |
-| | **Look up track IDs** | Paste ASINs or track URLs in any format and get back title, artist, album, duration and audio-quality flags. |
+| | **Look up track IDs** | Paste ASINs or track URLs in any format and get back title, artist, album, duration, audio-quality flags, and ISRC. |
+| | **Export followed artists** | Every artist you follow: `id, name, followed`. |
+| | **Export library artists** | Library artists: `id, name, isFollowed`. |
+| | **Export recently opened** | The first 50 albums, artists, playlists, tracks, or stations you opened: `type, id, title, opened_at`. |
 
 You also get:
 - A progress bar with live text, e.g. *"Page 42 · 4,200 plays · reached 9/14/2026"*
@@ -74,8 +77,7 @@ You also get:
   `https://music.amazon.com/my/playlists/<id>` or `/user-playlists/<id>`.
 - **History:** a full year of heavy listening is roughly 300 pages and takes about 8 to 10 minutes because of the
   polite rate limit. Keep the tab open; it can be in the background.
-- **Listening time is an estimate.** Amazon reports when each play started but not how long you
-  listened, so the hours figure adds up full track lengths and counts skipped tracks as fully played.
+- **Listening time is an estimate.** Plays marked skipped are left out of the hour total. Other plays still count as the full track length, because Amazon does not report how much of the track actually played.
 - Your browser may ask once whether music.amazon.com may download **multiple files** (JSON + CSV). Allow it.
 
 ## How it works

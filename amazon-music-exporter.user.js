@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Amazon Music Exporter
 // @namespace    https://github.com/Enazzzz
-// @version      1.0.0
+// @version      1.1.0
 // @description  Export your own Amazon Music playlists, full listening history, and track metadata to JSON + CSV. Read-only, runs locally in your browser.
 // @author       Zane Davis (Enazzzz)
 // @homepageURL  https://github.com/Enazzzz/amazon-music-exporter
@@ -75,7 +75,7 @@
   // 1. CORE (pure logic, no DOM)
   // ===========================================================================
   const Core = (() => {
-    const VERSION = '1.0.0';
+    const VERSION = '1.1.0';
     const DISCLAIMER_URL = 'https://github.com/Enazzzz/amazon-music-exporter/blob/main/DISCLAIMER.md';
     const DAY_MS = 86400000;
 
@@ -245,25 +245,52 @@
         trackUrl: node.url || (node.id ? `https://music.amazon.com/tracks/${node.id}` : ''),
         albumUrl: (node.album && node.album.url) || '',
         previewUrl: node.previewUrl || '',
+        // Catalog code. Empty when the track lookup has not been run yet.
+        isrc: typeof node.isrc === 'string' ? node.isrc : '',
       };
     }
 
     // ---- GraphQL query builders ----------------------------------------------------
     const HISTORY_TRACK_FIELDS_RICH = 'id title duration album{id shortTitle} contributingArtists{edges{role node{id name}}}';
     const HISTORY_TRACK_FIELDS_BASIC = 'id title';
-    const LOOKUP_TRACK_FIELDS = 'id title duration trackNumber hasLyrics url audioQualities parentalSettings{hasExplicitLanguage} images{url width height imageType} album{id shortTitle url} contributingArtists{edges{role node{id name url}}}';
-    const PLAYLIST_TRACK_FIELDS = 'id title duration trackNumber hasLyrics previewUrl url audioQualities parentalSettings{hasExplicitLanguage} likesContext{state} images{url width height imageType} contributingArtists{edges{role node{id name url}}} album{id shortTitle url}';
+    const LOOKUP_TRACK_FIELDS = 'id isrc title duration trackNumber hasLyrics url audioQualities parentalSettings{hasExplicitLanguage} images{url width height imageType} album{id shortTitle url} contributingArtists{edges{role node{id name url}}}';
+    const PLAYLIST_TRACK_FIELDS = 'id isrc title duration trackNumber hasLyrics previewUrl url audioQualities parentalSettings{hasExplicitLanguage} likesContext{state} images{url width height imageType} contributingArtists{edges{role node{id name url}}} album{id shortTitle url}';
+    const ARTIST_CONNECTIONS = { followedArtists: true, libraryArtists: true };
 
-    function buildHistoryQuery(cursor, rich = true, limit = 100) {
+    function buildHistoryQuery(cursor, rich = true, limit = 100, playMeta = true) {
       const fields = rich ? HISTORY_TRACK_FIELDS_RICH : HISTORY_TRACK_FIELDS_BASIC;
       const args = `limit:${limit}` + (cursor ? `, cursor:${gqlString(cursor)}` : '');
-      return `query{user{recentTrackPlayback(${args}){edgeCount pageInfo{hasNextPage token endCursor} edges{playedAt node{__typename ... on Track{${fields}}}}}}}`;
+      // skipped and device.family sit on the play edge, not on the track.
+      const edge = playMeta ? 'playedAt skipped device{family}' : 'playedAt';
+      return `query{user{recentTrackPlayback(${args}){edgeCount pageInfo{hasNextPage token endCursor} edges{${edge} node{__typename ... on Track{${fields}}}}}}}`;
     }
 
-    function buildPlaylistQuery(id, after, pageSize = 100) {
+    function buildPlaylistQuery(id, after, pageSize = 100, fields = PLAYLIST_TRACK_FIELDS) {
       const args = `first:${pageSize}` + (after ? `, after:${gqlString(after)}` : '');
       return `query{playlist(id:${gqlString(id)}){id title trackCount duration visibility description url curator{name} ` +
-        `tracks(${args}){totalCount edgeCount pageInfo{hasNextPage token endCursor} edges{cursor node{__typename ... on Track{${PLAYLIST_TRACK_FIELDS}}}}}}}`;
+        `tracks(${args}){totalCount edgeCount pageInfo{hasNextPage token endCursor} edges{cursor node{__typename ... on Track{${fields}}}}}}}`;
+    }
+
+    /** Page followedArtists or libraryArtists. Cursor is pageInfo.token. */
+    function buildArtistsQuery(field, cursor, limit = 100) {
+      if (!ARTIST_CONNECTIONS[field]) throw new Error('Unknown artist connection: ' + field);
+      const args = `limit:${limit}` + (cursor ? `, cursor:${gqlString(cursor)}` : '');
+      return `query{user{${field}(${args}){pageInfo{hasNextPage token endCursor} edges{node{__typename id name followsContext{isFollowed}}}}}}`;
+    }
+
+    /**
+     * First page only. A later page can fail when a saved playlist was deleted,
+     * so this export does not follow the cursor.
+     */
+    function buildRecentEntitiesQuery(limit = 50) {
+      const fragments = [
+        '... on Album{id title}',
+        '... on Artist{id name}',
+        '... on Playlist{id title}',
+        '... on Track{id title}',
+        '... on Station{id name}',
+      ].join(' ');
+      return `query{user{recentEntitiesPlayback(limit:${Number(limit) || 50}){edges{playedDate node{__typename ${fragments}}}}}}`;
     }
 
     function buildLookupQuery(ids, fields = LOOKUP_TRACK_FIELDS) {
@@ -298,6 +325,9 @@
           album: t.album,
           albumAsin: t.albumAsin,
           duration: t.duration,
+          skipped: typeof e.skipped === 'boolean' ? e.skipped : null,
+          deviceFamily: (e.device && typeof e.device.family === 'string') ? e.device.family : '',
+          isrc: t.isrc || '',
         });
       }
       const pi = conn.pageInfo || {};
@@ -365,6 +395,40 @@
       };
     }
 
+    /** Parse one followedArtists or libraryArtists page. */
+    function parseArtistsPage(json, field) {
+      const user = json && json.data && json.data.user;
+      const conn = user && user[field];
+      if (!conn) return null;
+      const rows = [];
+      for (const e of conn.edges || []) {
+        const n = e && e.node;
+        if (!n || !n.id) continue;
+        const followed = n.followsContext ? !!n.followsContext.isFollowed : null;
+        rows.push({ id: n.id, name: n.name != null ? n.name : '', isFollowed: followed });
+      }
+      const pi = conn.pageInfo || {};
+      return { rows, hasNext: !!pi.hasNextPage, token: pi.token || null };
+    }
+
+    /** Parse the single recentEntitiesPlayback page this export requests. */
+    function parseRecentEntitiesPage(json) {
+      const conn = json && json.data && json.data.user && json.data.user.recentEntitiesPlayback;
+      if (!conn) return null;
+      const rows = [];
+      for (const e of conn.edges || []) {
+        const n = e && e.node;
+        if (!n || !n.id) continue;
+        rows.push({
+          type: n.__typename || '',
+          id: n.id,
+          title: n.title || n.name || '',
+          openedAt: typeof e.playedDate === 'string' ? e.playedDate : '',
+        });
+      }
+      return { rows };
+    }
+
     // ---- cutoff logic ----------------------------------------------------------------
     const PRESETS = { '7d': 7, '30d': 30, '90d': 90, '1y': 365, all: null };
 
@@ -407,7 +471,7 @@
       const artists = new Map(), tracks = new Map(), months = new Map(), days = new Set();
       let seconds = 0, withDuration = 0, newest = null, oldest = null;
       for (const p of plays) {
-        if (typeof p.duration === 'number') { seconds += p.duration; withDuration++; }
+        if (typeof p.duration === 'number' && p.skipped !== true) { seconds += p.duration; withDuration++; }
         const a = p.artist || '(unknown artist)';
         artists.set(a, (artists.get(a) || 0) + 1);
         const key = p.asin || `${p.title}\u0000${a}`;
@@ -435,7 +499,7 @@
         activeDays: days.size,
         avgHoursPerActiveDay: days.size ? Math.round((estSeconds / 3600 / days.size) * 10) / 10 : 0,
         newest, oldest,
-        note: 'Estimated time = sum of full track lengths (Amazon does not report skips or partial plays). Plays with unknown length use the average.',
+        note: 'Estimated time sums full track lengths and leaves out plays marked skipped. Plays with unknown length use the average of the ones that have a length.',
         topArtists: [...artists.entries()].sort((x, y) => y[1] - x[1]).slice(0, topN).map(([artist, plays]) => ({ artist, plays })),
         topTracks: [...tracks.values()].sort((x, y) => y.plays - x.plays).slice(0, topN),
         playsByMonth: Object.fromEntries([...months.entries()].sort()),
@@ -466,18 +530,22 @@
     }
 
     // ---- row shapes for CSV ----------------------------------------------------------
-    const HISTORY_COLUMNS = ['played_at_utc', 'played_at_local', 'asin', 'title', 'artist', 'featured_artists', 'album', 'album_asin', 'duration_sec'];
+    const HISTORY_COLUMNS = ['played_at', 'asin', 'title', 'artist', 'album', 'duration', 'skipped', 'device_family', 'isrc'];
     function historyCsvRow(p) {
       return {
-        played_at_utc: p.playedAt,
-        played_at_local: isoLocal(p.playedAt),
-        asin: p.asin, title: p.title, artist: p.artist,
-        featured_artists: p.featuredArtists || [], album: p.album,
-        album_asin: p.albumAsin, duration_sec: p.duration,
+        played_at: p.playedAt,
+        asin: p.asin,
+        title: p.title,
+        artist: p.artist,
+        album: p.album,
+        duration: p.duration,
+        skipped: p.skipped,
+        device_family: p.deviceFamily || '',
+        isrc: p.isrc || '',
       };
     }
 
-    const PLAYLIST_COLUMNS = ['position', 'asin', 'title', 'artist', 'featured_artists', 'album', 'album_asin', 'duration_sec', 'duration', 'track_number', 'explicit', 'lyrics', 'hd', 'ultra_hd', 'dolby_atmos', 'sony_360', 'liked', 'art_url', 'track_url'];
+    const PLAYLIST_COLUMNS = ['position', 'asin', 'title', 'artist', 'featured_artists', 'album', 'album_asin', 'duration_sec', 'duration', 'track_number', 'explicit', 'lyrics', 'hd', 'ultra_hd', 'dolby_atmos', 'sony_360', 'liked', 'art_url', 'track_url', 'isrc'];
     function playlistCsvRow(r) {
       return {
         position: r.position, asin: r.asin, title: r.title, artist: r.artist,
@@ -485,19 +553,33 @@
         duration_sec: r.duration, duration: formatDuration(r.duration), track_number: r.trackNumber,
         explicit: r.explicit, lyrics: r.hasLyrics, hd: r.hd, ultra_hd: r.ultraHd,
         dolby_atmos: r.dolbyAtmos, sony_360: r.sony360, liked: r.liked,
-        art_url: r.artUrl, track_url: r.trackUrl,
+        art_url: r.artUrl, track_url: r.trackUrl, isrc: r.isrc || '',
       };
     }
 
-    const LOOKUP_COLUMNS = ['asin', 'found', 'title', 'artist', 'featured_artists', 'album', 'album_asin', 'duration_sec', 'track_number', 'explicit', 'lyrics', 'ultra_hd', 'dolby_atmos', 'sony_360', 'art_url', 'track_url'];
+    const LOOKUP_COLUMNS = ['asin', 'found', 'title', 'artist', 'featured_artists', 'album', 'album_asin', 'duration_sec', 'track_number', 'explicit', 'lyrics', 'ultra_hd', 'dolby_atmos', 'sony_360', 'art_url', 'track_url', 'isrc'];
     function lookupCsvRow(asin, t) {
       if (!t) return { asin, found: false };
       return {
         asin, found: true, title: t.title, artist: t.artist, featured_artists: t.featuredArtists,
         album: t.album, album_asin: t.albumAsin, duration_sec: t.duration, track_number: t.trackNumber,
         explicit: t.explicit, lyrics: t.hasLyrics, ultra_hd: t.ultraHd, dolby_atmos: t.dolbyAtmos,
-        sony_360: t.sony360, art_url: t.artUrl, track_url: t.trackUrl,
+        sony_360: t.sony360, art_url: t.artUrl, track_url: t.trackUrl, isrc: t.isrc || '',
       };
+    }
+
+    const FOLLOWED_ARTIST_COLUMNS = ['id', 'name', 'followed'];
+    const LIBRARY_ARTIST_COLUMNS = ['id', 'name', 'isFollowed'];
+    function followedArtistCsvRow(a) {
+      return { id: a.id, name: a.name, followed: a.isFollowed };
+    }
+    function libraryArtistCsvRow(a) {
+      return { id: a.id, name: a.name, isFollowed: a.isFollowed };
+    }
+
+    const RECENT_ENTITY_COLUMNS = ['type', 'id', 'title', 'opened_at'];
+    function recentEntityCsvRow(r) {
+      return { type: r.type, id: r.id, title: r.title, opened_at: r.openedAt };
     }
 
     // ---- errors ------------------------------------------------------------------------
@@ -565,6 +647,15 @@
           if (res.status === 401 || res.status === 403) {
             throw new ExportError(`HTTP ${res.status}: the captured session looks expired. Reload the page and try again.`, 'auth');
           }
+          if (res.status === 400) {
+            let json;
+            try { json = await res.json(); } catch (e) { throw new ExportError('HTTP 400', 'http'); }
+            if (json && json.errors && json.errors.length) {
+              const msg = json.errors.map((e) => e && e.message).filter(Boolean).join(' | ').slice(0, 500);
+              throw new ExportError('GraphQL error: ' + msg, 'graphql', json.errors);
+            }
+            throw new ExportError('HTTP 400', 'http');
+          }
           if (res.status < 200 || res.status >= 300) {
             throw new ExportError(`HTTP ${res.status}`, 'http');
           }
@@ -594,18 +685,19 @@
       state.nulls = state.nulls || 0;
       state.nonTrack = state.nonTrack || 0;
       if (state.rich === undefined) state.rich = true;
+      if (state.playMeta === undefined) state.playMeta = true;
       const seenTokens = new Set();
       const seenPlays = new Set(state.plays.map((p) => p.playedAt + '|' + p.asin));
       while (!state.done) {
         let json;
         try {
-          json = await client.gql(buildHistoryQuery(state.token, state.rich), o.cancel, o.onWait);
+          json = await client.gql(buildHistoryQuery(state.token, state.rich, 100, state.playMeta), o.cancel, o.onWait);
         } catch (e) {
-          // If Amazon rejects artist/album fields on history nodes, fall back to the
-          // proven minimal query and resolve metadata via track lookup afterwards.
-          if (state.rich && state.pages === 0 && isUnknownArgError(e)) {
-            state.rich = false;
-            continue;
+          // Artist/album fields, or the skip/device fields, can be rejected independently.
+          // Drop the rich selection first, then the play-edge fields, then give up.
+          if (state.pages === 0 && isUnknownArgError(e)) {
+            if (state.rich) { state.rich = false; continue; }
+            if (state.playMeta) { state.playMeta = false; continue; }
           }
           throw e;
         }
@@ -649,9 +741,26 @@
             p.album = p.album || t.album;
             p.albumAsin = p.albumAsin || t.albumAsin;
             if (p.duration == null) p.duration = t.duration;
+            if (!p.isrc && t.isrc) p.isrc = t.isrc;
           }
           state.lookedUp = missing.length;
           state.lookupNotFound = found.notFound;
+        }
+      }
+      // ISRC is not on the history edge. Look up every ASIN that still lacks one.
+      if (o.resolveIsrc !== false) {
+        const need = [...new Set(state.plays.filter((p) => p.asin && !p.isrc).map((p) => p.asin))];
+        if (need.length) {
+          const found = await runLookup(client, need, {
+            cancel: o.cancel, onWait: o.onWait,
+            onProgress: (x) => o.onProgress && o.onProgress({ phase: 'isrc', done: x.done, total: x.total, plays: state.plays.length }),
+          });
+          for (const p of state.plays) {
+            const t = found.results[p.asin];
+            if (t && t.isrc) p.isrc = t.isrc;
+          }
+          state.isrcLookedUp = need.length;
+          state.isrcNotFound = found.notFound.length;
         }
       }
       return state;
@@ -662,11 +771,23 @@
       const o = opts || {};
       const batch = o.batch || 40;
       const results = o.results || {};
+      let fields = o.fields || LOOKUP_TRACK_FIELDS;
       const todo = ids.filter((id) => !(id in results));
       let done = ids.length - todo.length;
       for (let i = 0; i < todo.length; i += batch) {
         const b = todo.slice(i, i + batch);
-        const json = await client.gql(buildLookupQuery(b), o.cancel, o.onWait);
+        let json;
+        try {
+          json = await client.gql(buildLookupQuery(b, fields), o.cancel, o.onWait);
+        } catch (e) {
+          // Drop ISRC once if this schema rejects it, then keep going.
+          if (fields.includes('isrc') && isUnknownArgError(e) && /isrc/i.test(e.message)) {
+            fields = fields.replace(/\bisrc\b/g, '').replace(/\s+/g, ' ').trim();
+            json = await client.gql(buildLookupQuery(b, fields), o.cancel, o.onWait);
+          } else {
+            throw e;
+          }
+        }
         Object.assign(results, parseLookupResponse(json, b));
         done += b.length;
         if (o.onProgress) o.onProgress({ phase: 'lookup', done, total: ids.length });
@@ -684,12 +805,17 @@
       let after = null;
       let mode = 'token'; // which pageInfo value to feed into `after`
       let switched = false;
+      let fields = PLAYLIST_TRACK_FIELDS;
       const seenAfter = new Set();
       for (;;) {
         let json;
         try {
-          json = await client.gql(buildPlaylistQuery(id, after), o.cancel, o.onWait);
+          json = await client.gql(buildPlaylistQuery(id, after, 100, fields), o.cancel, o.onWait);
         } catch (e) {
+          if (!after && fields.includes('isrc') && isUnknownArgError(e) && /isrc/i.test(e.message)) {
+            fields = fields.replace(/\bisrc\b/g, '').replace(/\s+/g, ' ').trim();
+            continue;
+          }
           // A rejected cursor value: try the other pageInfo flavour once.
           if (after && !switched && e && e.kind === 'graphql' && state.lastPage) {
             switched = true;
@@ -763,17 +889,52 @@
       return { playlists: out, warning };
     }
 
+    /** Page followedArtists or libraryArtists until the cursor ends. */
+    async function runArtists(client, field, opts) {
+      const o = opts || {};
+      const rows = [];
+      const seen = new Set();
+      let token = null;
+      const seenTokens = new Set();
+      for (let guard = 0; guard < 100; guard++) {
+        const json = await client.gql(buildArtistsQuery(field, token), o.cancel, o.onWait);
+        const page = parseArtistsPage(json, field);
+        if (!page) throw new ExportError('Unexpected response shape for ' + field + '.', 'parse');
+        for (const row of page.rows) {
+          if (seen.has(row.id)) continue;
+          seen.add(row.id);
+          rows.push(row);
+        }
+        if (o.onProgress) o.onProgress({ phase: field, done: rows.length });
+        if (!page.hasNext || !page.token || seenTokens.has(page.token)) break;
+        seenTokens.add(page.token);
+        token = page.token;
+      }
+      return { rows };
+    }
+
+    /** One page of albums, artists, and playlists that were opened. */
+    async function runRecentEntities(client, opts) {
+      const o = opts || {};
+      const json = await client.gql(buildRecentEntitiesQuery(o.limit || 50), o.cancel, o.onWait);
+      const page = parseRecentEntitiesPage(json);
+      if (!page) throw new ExportError('Unexpected response shape for recently opened items.', 'parse');
+      return page;
+    }
+
     return {
       VERSION, DISCLAIMER_URL, gqlString, isoLocal, fileStamp, safeFileName, formatDuration,
       csvEscape, toCSV, extractPlaylistId, extractAsins,
       headersToObject, sanitizeHeaders, looksAuthenticated,
       normalizeTrack, artistsOf, bestImage,
-      buildHistoryQuery, buildPlaylistQuery, buildLookupQuery, buildPlaylistsQuery,
-      parseHistoryPage, parsePlaylistPage, parseLookupResponse, parsePlaylistsPage,
+      buildHistoryQuery, buildPlaylistQuery, buildLookupQuery, buildPlaylistsQuery, buildArtistsQuery, buildRecentEntitiesQuery,
+      parseHistoryPage, parsePlaylistPage, parseLookupResponse, parsePlaylistsPage, parseArtistsPage, parseRecentEntitiesPage,
       PRESETS, resolveCutoff, effectiveCutoff, isBeforeCutoff,
       computeStats, playlistSummary,
       HISTORY_COLUMNS, historyCsvRow, PLAYLIST_COLUMNS, playlistCsvRow, LOOKUP_COLUMNS, lookupCsvRow,
-      ExportError, createClient, runHistory, runLookup, runPlaylist, runListPlaylists,
+      FOLLOWED_ARTIST_COLUMNS, followedArtistCsvRow, LIBRARY_ARTIST_COLUMNS, libraryArtistCsvRow,
+      RECENT_ENTITY_COLUMNS, recentEntityCsvRow,
+      ExportError, createClient, runHistory, runLookup, runPlaylist, runListPlaylists, runArtists, runRecentEntities,
     };
   })();
 
@@ -957,8 +1118,8 @@
           let frac = null;
           if (cutMs != null && reached && newestMs) frac = (newestMs - reached.getTime()) / Math.max(1, newestMs - cutMs);
           ui.progress(frac, `Page ${p.pages} · ${p.plays.toLocaleString()} plays · reached ${reached ? reached.toLocaleDateString() : '…'}`);
-        } else if (p.phase === 'lookup') {
-          ui.progress(p.done / p.total, `Looking up track details ${p.done}/${p.total}`);
+        } else if (p.phase === 'lookup' || p.phase === 'isrc') {
+          ui.progress(p.done / p.total, `Looking up ISRC and track details ${p.done}/${p.total}`);
         }
       },
     });
@@ -1054,6 +1215,41 @@
     ui.done(`Done: found ${out.json.found}/${ids.length} tracks.`);
   }
 
+  async function doArtists(ui, field) {
+    const cancel = { cancelled: false };
+    const columns = field === 'followedArtists' ? Core.FOLLOWED_ARTIST_COLUMNS : Core.LIBRARY_ARTIST_COLUMNS;
+    const toRow = field === 'followedArtists' ? Core.followedArtistCsvRow : Core.libraryArtistCsvRow;
+    const label = field === 'followedArtists' ? 'Followed artists' : 'Library artists';
+    let rows = [];
+    job = {
+      cancel, kind: field, columns,
+      partial: () => ({
+        json: Object.assign(meta({ kind: field, count: rows.length }), { artists: rows }),
+        rows: rows.map(toRow),
+      }),
+    };
+    ui.startJob(label);
+    const res = await Core.runArtists(client, field, {
+      cancel, onWait: (m) => ui.status(m),
+      onProgress: (p) => ui.progress(null, `${label}: ${p.done}`),
+    });
+    rows = res.rows;
+    const out = job.partial();
+    const base = field === 'followedArtists' ? 'followed_artists' : 'library_artists';
+    downloadPair(`${base}_${Core.fileStamp()}`, out.json, columns, out.rows);
+    ui.done(`Done: ${rows.length} ${label.toLowerCase()}.`);
+  }
+
+  async function doRecent(ui) {
+    const cancel = { cancelled: false };
+    job = { cancel, kind: 'recent', partial: null };
+    ui.startJob('Recently opened');
+    const page = await Core.runRecentEntities(client, { limit: 50, cancel, onWait: (m) => ui.status(m) });
+    const rows = page.rows.map(Core.recentEntityCsvRow);
+    downloadPair(`recently_opened_${Core.fileStamp()}`, Object.assign(meta({ kind: 'recently-opened', count: rows.length, note: 'First page only (50).' }), { items: page.rows }), Core.RECENT_ENTITY_COLUMNS, rows);
+    ui.done(`Done: ${rows.length} recently opened items (first page).`);
+  }
+
   function downloadPartial() {
     if (!job || !job.partial) return;
     const out = job.partial();
@@ -1144,7 +1340,7 @@
     const plBtn = h('button', { class: 'btn', text: 'Export playlist' });
     panes.pl = h('div', { class: 'pane' },
       h('label', { text: 'Playlist' }), plInput, plDetected, plBtn,
-      h('div', { class: 'hint', text: 'Exports JSON + CSV: position, title, artists, album, duration, explicit, lyrics, Ultra HD / Atmos / 360, liked, art + track URLs. Duplicates are listed in the JSON summary.' }));
+      h('div', { class: 'hint', text: 'Exports JSON + CSV, including ISRC. Also: position, title, artists, album, duration, explicit, lyrics, Ultra HD / Atmos / 360, liked, art + track URLs.' }));
 
     // History pane
     const range = h('select', {},
@@ -1165,7 +1361,7 @@
       h('label', { class: 'chk' }, sinceLast, 'Only new plays since my last export'), lastInfo,
       h('label', { class: 'chk' }, resolve, 'Fill in missing artist/album details'),
       histBtn, resumeBtn, statsBox,
-      h('div', { class: 'hint', text: 'Pages 100 plays at a time (~1.5 s each). A year of heavy listening can take several minutes. Progress is checkpointed every 10 pages.' }));
+      h('div', { class: 'hint', text: 'Each play includes skipped and device family. ISRCs are filled by track lookup. Pages 100 plays at a time (~1.5 s each).' }));
 
     // More pane
     const loadPlBtn = h('button', { class: 'btn sec', text: 'Load my playlists' });
@@ -1173,9 +1369,15 @@
     const allBtn = h('button', { class: 'btn', text: 'Export selected playlists', disabled: true });
     const asinBox = h('textarea', { placeholder: 'Paste track IDs (B0…) or track URLs, any format' });
     const lookupBtn = h('button', { class: 'btn', text: 'Look up track IDs' });
+    const followedBtn = h('button', { class: 'btn', text: 'Export followed artists' });
+    const libraryArtistsBtn = h('button', { class: 'btn', text: 'Export library artists' });
+    const recentBtn = h('button', { class: 'btn', text: 'Export recently opened' });
     const resetBtn = h('button', { class: 'btn sec', text: 'Forget “last export” marker' });
     panes.more = h('div', { class: 'pane' },
       h('label', { text: 'All my playlists' }), loadPlBtn, plist, allBtn,
+      h('label', { text: 'Artists' }), followedBtn, libraryArtistsBtn,
+      h('label', { text: 'Recently opened' }), recentBtn,
+      h('div', { class: 'hint', text: 'Followed artists and library artists are full lists. Recently opened is the first 50 only.' }),
       h('label', { text: 'Track ID lookup' }), asinBox, lookupBtn,
       h('label', { text: 'Housekeeping' }), resetBtn);
 
@@ -1226,7 +1428,7 @@
     hdr.addEventListener('dblclick', () => { store.del('pos'); Object.assign(wrap.style, { left: 'auto', top: 'auto', right: '16px', bottom: '96px' }); });
 
     // dynamic bits
-    const allActionBtns = [plBtn, histBtn, resumeBtn, loadPlBtn, allBtn, lookupBtn];
+    const allActionBtns = [plBtn, histBtn, resumeBtn, loadPlBtn, allBtn, lookupBtn, followedBtn, libraryArtistsBtn, recentBtn];
     let busy = false;
     const refreshConn = () => {
       const ok = !!auth.headers;
@@ -1318,6 +1520,9 @@
     loadPlBtn.addEventListener('click', run(() => doLoadPlaylists(ui)));
     allBtn.addEventListener('click', run(() => doPlaylistsBatch(ui, (plist._boxes || []).filter((b) => b.checked).map((b) => b._pl))));
     lookupBtn.addEventListener('click', run(() => doLookup(ui, asinBox.value)));
+    followedBtn.addEventListener('click', run(() => doArtists(ui, 'followedArtists')));
+    libraryArtistsBtn.addEventListener('click', run(() => doArtists(ui, 'libraryArtists')));
+    recentBtn.addEventListener('click', run(() => doRecent(ui)));
     resetBtn.addEventListener('click', () => { store.del('lastPlayedAt'); store.del('checkpoint_history'); sinceLast.checked = false; refreshHist(); msg.className = 'msg ok'; msg.textContent = 'Cleared the last-export marker and any saved checkpoint.'; });
     cancelBtn.addEventListener('click', () => { if (job && job.cancel) job.cancel.cancelled = true; ptext.textContent = 'Cancelling…'; });
     partialBtn.addEventListener('click', downloadPartial);
